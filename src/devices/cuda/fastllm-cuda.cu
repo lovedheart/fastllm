@@ -670,16 +670,43 @@ __global__ void FastllmMulKernel(half* a, half *b, half v, int len) {
     }
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmMulBatchKernel(float** pointer, int batch, float v) {
-    float *input = pointer[blockIdx.x];
-    float *output = pointer[blockIdx.x + batch];
-    int len = (int)((unsigned long long)pointer[blockIdx.x + batch * 2]);
-    for (int i = threadIdx.x; i < len; i += THREAD_PER_BLOCK) {
-        output[i] = input[i] * v;
+struct MulBatchDesc {
+    float* input;
+    float* output;
+    int len;
+};
+
+template<int THREAD_PER_BLOCK>
+__global__ void FastllmMulBatchKernel(
+    const MulBatchDesc* __restrict__ desc,
+    float v
+) {
+    const MulBatchDesc d = desc[blockIdx.x];
+    float* __restrict__ input  = d.input;
+    float* __restrict__ output = d.output;
+    const int len = d.len;
+    const int tid = threadIdx.x;
+
+    // 检查输入指针是否是16字节对齐的
+    if (((uintptr_t)input % 16 == 0) && ((uintptr_t)output % 16 == 0)) {
+        // --- 快速路径 (Fast Path): 地址对齐，使用 float4 ---
+        for (int i = tid * 4; i + 3 < len; i += THREAD_PER_BLOCK * 4) {
+            int idx4 = i / 4;
+            float4 x = reinterpret_cast<const float4*>(input)[idx4];
+            x.x *= v; x.y *= v; x.z *= v; x.w *= v;
+            reinterpret_cast<float4*>(output)[idx4] = x;
+        }
+        const int tail_start = len - (len % 4);
+        for (int i = tail_start + tid; i < len; i += THREAD_PER_BLOCK) {
+            output[i] = input[i] * v;
+        }
+    } else {
+        // --- 安全路径 (Safe Path): 地址未对齐，逐个float处理 ---
+        for (int i = tid; i < len; i += THREAD_PER_BLOCK) {
+            output[i] = input[i] * v;
+        }
     }
 }
-
 
 __global__ void FastllmReduceKernel(float *output, float* input, int len, int threadNum) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
